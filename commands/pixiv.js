@@ -1,0 +1,1177 @@
+import fs from 'fs';
+import path from 'path';
+import axios from 'axios';
+import { config } from '../lib/config.js';
+import { log } from '../lib/logger.js';
+import { delay } from '../lib/utils.js';
+import { getUserProfile } from '../lib/hu-tao-ai.js';
+
+// Configuration
+const MAX_IMAGES = 10;
+const DOWNLOAD_DIR = './temp/pixiv';
+const DOWNLOAD_DELAY_MS = 800;
+const DOWNLOAD_RETRY = 2;
+const BASE_URL = 'https://www.pixiv.net';
+
+// Make sure download directory exists
+if (!fs.existsSync(DOWNLOAD_DIR)) {
+  fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+}
+
+// State Maps (in-memory)
+const pixivStates = new Map();
+const r18PendingMap = new Map();
+const r18GrantMap = new Map();
+
+// Helper to clean expired states
+function cleanExpiredStates() {
+  const now = Date.now();
+  for (const [jid, state] of pixivStates.entries()) {
+    if (now > state.expiry) {
+      if (state.r18Images) {
+        for (const img of state.r18Images) {
+          try {
+            if (fs.existsSync(img.File)) fs.unlinkSync(img.File);
+          } catch {}
+        }
+      }
+      pixivStates.delete(jid);
+    }
+  }
+  for (const [sender, req] of r18PendingMap.entries()) {
+    if (now > req.expiry) {
+      r18PendingMap.delete(sender);
+    }
+  }
+  for (const [sender, grant] of r18GrantMap.entries()) {
+    if (now > grant.grantedAt + 10 * 60 * 1000) {
+      r18GrantMap.delete(sender);
+    }
+  }
+}
+
+// Scraper Functions
+const pixivCookie = process.env.PIXIV_COOKIE || '';
+const headers = {
+  'referer': 'https://www.pixiv.net/',
+  'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36',
+  ...(pixivCookie && { cookie: pixivCookie })
+};
+
+async function searchPixiv(query, mode, page = 1) {
+  try {
+    const res = await axios.get(`${BASE_URL}/ajax/search/artworks/${encodeURIComponent(query)}`, {
+      params: {
+        word: query,
+        mode: mode,
+        p: page,
+        s_mode: 's_tag'
+      },
+      headers,
+      timeout: 10000
+    });
+    if (res.data?.error) {
+      throw new Error(res.data?.message || 'Pixiv search returned error');
+    }
+    const illusts = res.data?.body?.illustManga?.data || [];
+    return illusts.filter(item => item.illustType === 0 || item.illustType === '0' || !item.illustType);
+  } catch (err) {
+    if (err.response?.status === 403 || err.message?.includes('Cloudflare') || err.response?.data?.includes('Cloudflare')) {
+      throw new Error('Cloudflare Challenge');
+    }
+    throw err;
+  }
+}
+
+async function getArtworkDetail(id) {
+  const detailUrl = `${BASE_URL}/ajax/illust/${id}`;
+  const pagesUrl = `${BASE_URL}/ajax/illust/${id}/pages`;
+  
+  const [detailRes, pagesRes] = await Promise.all([
+    axios.get(detailUrl, { headers, timeout: 10000 }),
+    axios.get(pagesUrl, { headers, timeout: 10000 })
+  ]);
+  
+  const detail = detailRes.data?.body;
+  const pages = pagesRes.data?.body || [];
+  
+  if (!detail) throw new Error('Artwork detail not found');
+  
+  return {
+    Id: id,
+    Title: detail.title || detail.illustTitle || 'Untitled',
+    Author: detail.userName || 'Unknown',
+    Username: detail.userAccount || 'unknown',
+    Size: {
+      Page_count: detail.pageCount || pages.length || 1,
+      Width: detail.width || 0,
+      Height: detail.height || 0
+    },
+    Stats: {
+      Views: detail.viewCount || 0,
+      Likes: detail.likeCount || 0,
+      Bookmarks: detail.bookmarkCount || 0,
+      Comments: detail.commentCount || 0
+    },
+    Dates: {
+      Uploaded: detail.uploadDate || detail.createDate || null,
+      Created: detail.createDate || null
+    },
+    Tags: (detail.tags?.tags || []).map(t => t.translation?.en || t.tag || t.name || '').filter(Boolean).slice(0, 10).join(', ') || 'None',
+    xRestrict: detail.xRestrict || 0,
+    sl: detail.sanitityLevel || detail.sl || 2,
+    tagsRaw: (detail.tags?.tags || []).map(t => t.tag || t.name || ''),
+    pages: pages.length > 0 ? pages.map(p => p.urls?.original || p.urls?.regular) : [detail.urls?.original || detail.urls?.regular]
+  };
+}
+
+async function downloadPixivImage(url, id, pageIndex) {
+  const ext = url.split('.').pop().split('?')[0] || 'jpg';
+  const filePath = path.join(DOWNLOAD_DIR, `${id}_p${pageIndex}.${ext}`);
+  
+  let lastError;
+  for (let attempt = 1; attempt <= DOWNLOAD_RETRY; attempt++) {
+    try {
+      const response = await axios({
+        url,
+        method: 'GET',
+        responseType: 'stream',
+        headers,
+        timeout: 15000
+      });
+      
+      const writer = fs.createWriteStream(filePath);
+      response.data.pipe(writer);
+      
+      await new Promise((resolve, reject) => {
+        writer.on('finish', resolve);
+        writer.on('error', reject);
+      });
+      
+      return filePath;
+    } catch (err) {
+      lastError = err;
+      if (attempt < DOWNLOAD_RETRY) {
+        await delay(DOWNLOAD_DELAY_MS);
+      }
+    }
+  }
+  throw lastError;
+}
+
+// Helpers
+function formatDate(dateStr) {
+  if (!dateStr) return '';
+  try {
+    const date = new Date(dateStr);
+    if (isNaN(date.getTime())) return '';
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+    const day = String(date.getDate()).padStart(2, '0');
+    const month = months[date.getMonth()];
+    const year = date.getFullYear();
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    return `${day} ${month} ${year}, ${hours}:${minutes}`;
+  } catch {
+    return '';
+  }
+}
+
+function buildCaption(result, currentPage) {
+  const lines = [];
+  
+  if (result.Title) {
+    lines.push(`*${result.Title}*`);
+  }
+  
+  if (result.Author) {
+    const userPart = result.Username ? ` (@${result.Username})` : '';
+    lines.push(`👤 ${result.Author}${userPart}`);
+  }
+  
+  lines.push('');
+  
+  if (currentPage && result.Size?.Page_count) {
+    lines.push(`🖼️ Page ${currentPage}/${result.Size.Page_count}`);
+  }
+  
+  if (result.Size?.Width && result.Size?.Height) {
+    lines.push(`📐 ${result.Size.Width} × ${result.Size.Height}px`);
+  }
+  
+  lines.push('');
+  
+  const statsParts = [];
+  if (result.Stats?.Views !== undefined && result.Stats?.Views !== null) statsParts.push(`👁️ ${result.Stats.Views}`);
+  if (result.Stats?.Likes !== undefined && result.Stats?.Likes !== null) statsParts.push(`❤️ ${result.Stats.Likes}`);
+  if (result.Stats?.Bookmarks !== undefined && result.Stats?.Bookmarks !== null) statsParts.push(`🔖 ${result.Stats.Bookmarks}`);
+  if (result.Stats?.Comments !== undefined && result.Stats?.Comments !== null) statsParts.push(`💬 ${result.Stats.Comments}`);
+  if (statsParts.length > 0) {
+    lines.push(statsParts.join('  '));
+  }
+  
+  const dateStr = formatDate(result.Dates?.Uploaded || result.Dates?.Created);
+  if (dateStr) {
+    lines.push(`📅 ${dateStr}`);
+  }
+  
+  lines.push('');
+  
+  if (result.Tags && result.Tags !== 'None') {
+    lines.push(`🏷️ ${result.Tags}`);
+  }
+  
+  lines.push('');
+  
+  if (result.Id) {
+    lines.push(`🔗 https://www.pixiv.net/artworks/${result.Id}`);
+  }
+  
+  const cleanedLines = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] === '' && (i === 0 || lines[i - 1] === '')) {
+      continue;
+    }
+    cleanedLines.push(lines[i]);
+  }
+  return cleanedLines.join('\n').trim();
+}
+
+const isR18 = (item) => (
+  item.xRestrict === 1 ||
+  item.sl >= 4 ||
+  (item.tagsRaw && item.tagsRaw.some(t =>
+    /^r-?18/i.test(t?.tag || t?.name || t || '')
+  ))
+);
+
+// Loading Suggestions Picker
+export function getLoadingSuggestion(profile) {
+  const persona = profile.persona_seed || 'ceria';
+  const suggestions = {
+    jutek: [
+      "Atau ketik `.menu` kalau mau tau yang lain.",
+      "Gabut? Ketik `.ai [tanya apa aja]`.",
+      "Ketik `.sticker` kalau mau buat stiker.",
+      "Coba `.pinterest [keyword]` kalau bosan.",
+      "Nggak mau nunggu? Cari `.pixiv [keyword]` baru aja.",
+      "Ketik `.quote` aja kalau gabut."
+    ],
+    ceria: [
+      "Mau download gambar lain sambil nunggu? Ketik `.pixiv [keyword]` lagi aja yuk~! 😹🔥",
+      "Atau cobain `.ai [tanya apa aja]` dulu sambil nunggu, seru lho~! 😹✨",
+      "Eh, cobain `.sticker` buat bikin stiker lucu dari gambar deh! 👀",
+      "Mau tau fitur seru lainnya? Ketik `.menu` buat liat semua command~! 🎉",
+      "Bisa coba `.pinterest [keyword]` juga lho biar makin banyak gambarnya~! 🌸",
+      "Ada `.quote` buat dapet kata-kata keren kalo kamu lagi gabut~! 😆"
+    ],
+    santai: [
+      "atau .menu kalo penasaran ada apa aja",
+      "kalo bosen ngobrol aja, ketik .ai aja",
+      "bisa bikin stiker juga pake .sticker",
+      "cari pinterest? ketik .pinterest aja",
+      "lagi gabut? ketik .quote coba",
+      "cari gambar lain juga bisa, ketik .pixiv lagi"
+    ],
+    romance: [
+      "Sambil nunggu, mau ngobrol dulu sama aku? Ketik `.ai` aja ya~ 💕",
+      "Atau kamu mau coba bikin stiker manis? Ketik `.sticker` aja... 🥰",
+      "Ketik `.menu` untuk melihat apa saja yang bisa aku lakukan untukmu~ ❤️",
+      "Cari gambar lain di Pinterest juga seru lho, coba `.pinterest [keyword]` ya...",
+      "Kalau kamu lelah, ketik `.quote` biar aku kasih kata-kata indah~ ✨",
+      "Mau cari gambar lain lagi? Ketik `.pixiv [keyword]` aja, aku temenin..."
+    ],
+    partner: [
+      "Atau coba fitur lain dulu, ketik `.menu` buat liat list-nya.",
+      "Sambil nunggu, cobain `.ai` buat ngobrol santai aja.",
+      "Bisa bikin stiker juga lho pake `.sticker`, cobain deh.",
+      "Coba cari di Pinterest juga pake `.pinterest [keyword]`.",
+      "Lagi senggang? Coba `.quote` buat cari quotes bagus.",
+      "Boleh kok request gambar lain lagi, ketik aja `.pixiv [keyword]`."
+    ],
+    serius: [
+      "Tersedia juga fitur `.ai [pertanyaan]` untuk berdiskusi.",
+      "Anda dapat mengetik `.menu` untuk melihat daftar lengkap perintah.",
+      "Gunakan perintah `.sticker` pada gambar untuk membuat stiker.",
+      "Gunakan `.pinterest [keyword]` untuk mencari gambar dari Pinterest.",
+      "Gunakan `.quote` untuk menampilkan kutipan acak.",
+      "Anda dapat melakukan pencarian Pixiv lainnya tanpa harus menunggu ini selesai."
+    ]
+  };
+  
+  const pool = suggestions[persona] || suggestions.ceria;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// Persona & Mood Reply System
+export function getPixivReply(profile, type, data = {}) {
+  const persona = profile.persona_seed || 'ceria';
+  const moodScore = profile.mood_score || 0;
+  
+  let mood = 'normal';
+  if (moodScore < -30) mood = 'cold';
+  else if (moodScore > 30) mood = 'happy';
+
+  const responses = {
+    ceria: {
+      cold: {
+        ask_count: `Mau berapa gambar ${data.query}. Ketik .1 sampai .10.`,
+        ask_mode: `Pilih safe, all, atau r18. Ketik .safe / .all / .r18.`,
+        loading: `Lagi dicari.`,
+        done: `Nih.`,
+        error: `Gagal.`,
+        timeout: `Timeout.`,
+        invalid: `Salah.`,
+        typo_fix: `Maksud lo \`${data.corrected}\` kan. Yaudah.`,
+        r18_pending: `r18 butuh izin. Lagi dikirim ke admin.`,
+        r18_granted: `Izin ada. Proses.`,
+        r18_denied: `Ditolak.`,
+        all_r18_choice: `Ada *${data.count} gambar r18*. Pilih:\n.izin minta izin\n.skip buang\n.ganti tukar`
+      },
+      normal: {
+        ask_count: `Ooh mau liat gambar ${data.query}? Mau berapa? Ketik \`.1\` sampai \`.10\` aja~ 🔥`,
+        ask_mode: `Mau yang safe, all, atau r18? Ketik \`.safe\` / \`.all\` / \`.r18\``,
+        loading: `Oke, bentar ya lagi aku cariin dulu gambarnya~ ✨`,
+        done: `Ini dia gambarnya~! Selesai dikirim ya~ 🔥`,
+        error: `Aduh gagal/tidak ditemukan nih, coba cek keyword kamu lagi deh~ 🥀`,
+        timeout: `Lama banget nggak dijawab, sesi Pixiv-nya expired ya~`,
+        invalid: `Input kamu kurang pas nih, ketik yang bener ya~`,
+        typo_fix: `Eh maksudnya \`${data.corrected}\` ya? Oke oke~! 🔥`,
+        r18_pending: `Akses r18 butuh izin admin/owner. Aku kirim permintaannya dulu ya, tunggu bentar~`,
+        r18_granted: `Asyik! Izinnya udah di-allow sama admin. Lanjut aku proses ya~`,
+        r18_denied: `Yah, permintaannya ditolak admin. Mau coba safe atau all aja? 🥀`,
+        all_r18_choice: `Btw ada *${data.count} gambar r18* yang ketahan~ Mau gimana? 👀\n\`.izin\` — minta izin ke admin\n\`.skip\` — buang aja, udah cukup yang safe\n\`.ganti\` — ganti dengan gambar safe baru`
+      },
+      happy: {
+        ask_count: `Ooh mau liat gambar ${data.query}? Mau berapa? Ketik \`.1\` sampai \`.10\` aja yaa~!! 🔥✨`,
+        ask_mode: `Wokeey, ${data.count} gambar! Terus mau yang safe, all, atau r18? Ketik \`.safe\` / \`.all\` / \`.r18\` yaa~! ✨`,
+        loading: `Siaap~! Aku cariin dulu di Pixiv terus aku download ya, tunggu bentar~! 😹🔥`,
+        done: `Selesaii~! Ini dia gambarnya, cantik-cantik kan? 😹✨`,
+        error: `Duh, maaf banget gagal ngambil gambar/kosong nih... Coba lagi nanti ya~! 😭`,
+        timeout: `Yah kelamaan nggak dijawab, aku tutup ya sesi Pixiv-nya~! Ulangi dari awal lagi aja~ 😹`,
+        invalid: `Duh inputnya salah tuh! Pilih yang bener dong biar bisa aku proses~! 😹`,
+        typo_fix: `Eh maksudnya \`${data.corrected}\` ya? Oke oke~! Langsung aku proses ya! 🔥✨`,
+        r18_pending: `Wah mau r18~ 🔥 Aku kirimin dulu permintaan izinnya ke admin/owner ya, tunggu sebentar! Sambil nunggu, mau download gambar lain dulu? Atau cobain fitur lain? 😹✨`,
+        r18_granted: `Yeay! Admin udah kasih izin~ Langsung aku prosesin ya gambarnya! 🔥✨`,
+        r18_denied: `Aduh... admin nggak kasih izin nih 😹 Mau coba yang safe atau all aja?`,
+        all_r18_choice: `Btw ada *${data.count} gambar r18* yang ketahan nih~ Mau gimana? 👀\n\`.izin\` — minta izin ke admin\n\`.skip\` — buang aja, udah cukup yang safe\n\`.ganti\` — ganti dengan gambar safe baru`
+      }
+    },
+    jutek: {
+      cold: {
+        ask_count: `Berapa gambar. Ketik .1 sampai .10.`,
+        ask_mode: `Pilih: .safe / .all / .r18.`,
+        loading: `Tunggu.`,
+        done: `Selesai.`,
+        error: `Gagal.`,
+        timeout: `Timeout.`,
+        invalid: `Salah.`,
+        typo_fix: `Maksud lo \`${data.corrected}\`. Yaudah.`,
+        r18_pending: `r18 butuh izin. Lagi aku forward ke admin. Sambil tunggu, mau coba yang lain?`,
+        r18_granted: `Izin dikasih. Lanjut.`,
+        r18_denied: `Ditolak.`,
+        all_r18_choice: `Ada *${data.count} gambar r18*. Pilih:\n.izin minta izin admin\n.skip buang\n.ganti tukar`
+      },
+      normal: {
+        ask_count: `Mau berapa gambar ${data.query}? Ketik \`.1\` sampai \`.10\`.`,
+        ask_mode: `Pilih safe, all, atau r18. Ketik \`.safe\` / \`.all\` / \`.r18\`.`,
+        loading: `Lagi dicari. Tunggu.`,
+        done: `Nih.`,
+        error: `Gagal atau gak ketemu.`,
+        timeout: `Timeout. Ulangi.`,
+        invalid: `Input salah.`,
+        typo_fix: `Maksud lo \`${data.corrected}\` kan. Oke.`,
+        r18_pending: `r18 butuh izin. Lagi aku forward ke admin. Sambil tunggu, mau coba yang lain?`,
+        r18_granted: `Admin kasih izin. Lanjut proses.`,
+        r18_denied: `Ditolak. Coba safe atau all.`,
+        all_r18_choice: `Ada *${data.count} gambar r18*. Pilih:\n\`.izin\` minta izin admin\n\`.skip\` buang\n\`.ganti\` tukar sama safe`
+      },
+      happy: {
+        ask_count: `Mau liat ${data.query} kan? Berapa gambar? Ketik \`.1\` sampai \`.10\`.`,
+        ask_mode: `Dapet, ${data.count} gambar. Pilih mode: \`.safe\` / \`.all\` / \`.r18\`.`,
+        loading: `Bentar, lagi diproses.`,
+        done: `Nih gambarnya.`,
+        error: `Gak ketemu atau gagal. Coba lagi.`,
+        timeout: `Kelamaan. Sesi ditutup.`,
+        invalid: `Input salah. Ketik yang bener.`,
+        typo_fix: `Maksud lo \`${data.corrected}\` kan. Proses.`,
+        r18_pending: `Butuh izin admin. Lagi gue kirim. Tunggu aja.`,
+        r18_granted: `Admin kasih izin. Lanjut proses.`,
+        r18_denied: `Ditolak. Coba safe atau all.`,
+        all_r18_choice: `Ada *${data.count} gambar r18*. Pilih:\n\`.izin\` minta izin admin\n\`.skip\` buang\n\`.ganti\` tukar sama safe`
+      }
+    },
+    santai: {
+      cold: {
+        ask_count: `brp? ketik .1-.10.`,
+        ask_mode: `pilih: .safe/.all/.r18`,
+        loading: `tunggu bntr.`,
+        done: `nih.`,
+        error: `gagal.`,
+        timeout: `timeout.`,
+        invalid: `salah.`,
+        typo_fix: `\`${data.corrected}\` kan. yaudah.`,
+        r18_pending: `butuh izin. udh dikirim.`,
+        r18_granted: `diizinin. proses.`,
+        r18_denied: `ditolak.`,
+        all_r18_choice: `ada *${data.count} r18*. mau:\n.izin tanya admin\n.skip buang\n.ganti ganti`
+      },
+      normal: {
+        ask_count: `mau berapa gambar ${data.query}? ketik .1 sampai .10.`,
+        ask_mode: `mau safe, all, atau r18? ketik .safe / .all / .r18`,
+        loading: `yaudah tunggu bentar ya`,
+        done: `ini gambarnya`,
+        error: `ga ketemu atau error`,
+        timeout: `sesi expired karena kelamaan`,
+        invalid: `input salah`,
+        typo_fix: `\`${data.corrected}\` kali ya. yaudah.`,
+        r18_pending: `harus minta izin dulu buat r18. udah aku kirimin. mau ngapain dulu?`,
+        r18_granted: `boleh katanya. proses deh.`,
+        r18_denied: `ga boleh. yaudah coba yang lain aja.`,
+        all_r18_choice: `ada *${data.count} gambar r18* nih. mau:\n\`.izin\` tanya admin\n\`.skip\` skip aja\n\`.ganti\` ganti sama yang safe`
+      },
+      happy: {
+        ask_count: `gambar ${data.query} ya? pilih 1-10 deh, ketik .1 sampe .10 gitu`,
+        ask_mode: `ok ${data.count} gambar. tipenya apa? safe, all, apa r18? ketik .safe/.all/.r18 ya`,
+        loading: `bentar ya lagi dicariin dulu`,
+        done: `dah selesai nih, ini gambarnya`,
+        error: `yah gagal atau gak ketemu gambarnya, coba lagi aja`,
+        timeout: `kelamaan sih, sesinya angus ya, ulang aja`,
+        invalid: `salah ketik tuh, yang bener dong`,
+        typo_fix: `oalah \`${data.corrected}\` maksudnya. oke oke`,
+        r18_pending: `harus minta izin dulu buat r18. udah aku kirimin. mau ngapain dulu?`,
+        r18_granted: `boleh katanya. proses deh.`,
+        r18_denied: `ga boleh. yaudah coba yang lain aja.`,
+        all_r18_choice: `ada *${data.count} gambar r18* nih. mau:\n\`.izin\` tanya admin\n\`.skip\` skip aja\n\`.ganti\` ganti sama yang safe`
+      }
+    },
+    romance: {
+      cold: {
+        ask_count: `Berapa gambar? Ketik .1 sampai .10...`,
+        ask_mode: `Pilih safe, all, atau r18...`,
+        loading: `Lagi dicari...`,
+        done: `Nih...`,
+        error: `Gagal...`,
+        timeout: `Timeout...`,
+        invalid: `Salah...`,
+        typo_fix: `Maksudnya \`${data.corrected}\`... Oke.`,
+        r18_pending: `Minta izin admin dulu...`,
+        r18_granted: `Diizinkan. Proses...`,
+        r18_denied: `Ditolak...`,
+        all_r18_choice: `Ada *${data.count} r18*. Pilih:\n.izin\n.skip\n.ganti...`
+      },
+      normal: {
+        ask_count: `Mau lihat gambar ${data.query} ya? Ketik \`.1\` sampai \`.10\` ya...`,
+        ask_mode: `Mau yang safe, all, atau r18? Ketik \`.safe\` / \`.all\` / \`.r18\` ya...`,
+        loading: `Bentar ya, aku cari dan download dulu gambarnya...`,
+        done: `Ini gambarnya sudah selesai dikirim ya...`,
+        error: `Gagal mencari gambar atau tidak ditemukan...`,
+        timeout: `Sesi Pixiv kedaluwarsa karena tidak ada respons...`,
+        invalid: `Input tidak valid, silakan ketik dengan benar...`,
+        typo_fix: `Maksudnya \`${data.corrected}\` ya? Aku lanjut proses...`,
+        r18_pending: `Butuh izin admin untuk R18. Aku kirimkan dulu ya permintaannya...`,
+        r18_granted: `Admin sudah memberikan izin. Langsung aku proses ya...`,
+        r18_denied: `Permintaan R18 ditolak oleh admin. Silakan coba yang safe atau all...`,
+        all_r18_choice: `Ada *${data.count} gambar r18* yang tertahan. Kamu mau:\n\`.izin\` — minta izin ke admin\n\`.skip\` — buang saja\n\`.ganti\` — ganti dengan yang safe...`
+      },
+      happy: {
+        ask_count: `Kamu mau lihat gambar ${data.query} ya? Mau berapa banyak, Sayang? Ketik \`.1\` sampai \`.10\` ya~ ❤️`,
+        ask_mode: `Baik, ${data.count} gambar ya. Mau pilihan yang safe, all, atau r18, Manis? Ketik \`.safe\` / \`.all\` / \`.r18\`~ 💕`,
+        loading: `Tunggu sebentar ya, Sayang, aku carikan dulu gambarnya untukmu~ ❤️`,
+        done: `Ini dia gambarnya buat kamu, semoga suka ya~ 🥰💕`,
+        error: `Maaf ya Sayang, gambarnya gagal diambil atau tidak ditemukan... Coba lagi nanti ya~ 🥺`,
+        timeout: `Kamu sibuk ya? Sesinya expired karena kelamaan... Ulangi lagi nanti ya, Sayang~ 💕`,
+        invalid: `Inputnya kurang tepat, Manis... Tolong ketik yang benar ya~ 💕`,
+        typo_fix: `Maksud kamu \`${data.corrected}\` ya, Sayang? Aku langsung proses ya~ ❤️`,
+        r18_pending: `Kamu mau r18 ya? Aku harus minta izin ke admin/owner dulu, Sayang... Tunggu sebentar ya~ 💕`,
+        r18_granted: `Izinnya sudah diberikan oleh admin, Sayang! Langsung aku proses ya gambarnya~ ❤️`,
+        r18_denied: `Yah, admin nggak kasih izin, Sayang... Mau coba yang safe atau all aja? 🥺`,
+        all_r18_choice: `Sayang, ada *${data.count} gambar r18* yang tertahan... Pilihan kamu apa?\n\`.izin\` — minta izin ke admin\n\`.skip\` — lewatkan saja\n\`.ganti\` — ganti dengan gambar safe ya~ 💕`
+      }
+    },
+    partner: {
+      cold: {
+        ask_count: `Berapa gambar? Ketik .1 sampai .10.`,
+        ask_mode: `Pilih safe, all, atau r18.`,
+        loading: `Lagi diproses, tunggu.`,
+        done: `Nih gambarnya.`,
+        error: `Gagal/tidak ditemukan.`,
+        timeout: `Expired.`,
+        invalid: `Input salah.`,
+        typo_fix: `\`${data.corrected}\` kan. Oke.`,
+        r18_pending: `Minta izin admin dulu. Tunggu.`,
+        r18_granted: `Izin disetujui. Proses.`,
+        r18_denied: `Ditolak admin.`,
+        all_r18_choice: `Ada *${data.count} gambar r18*. Pilih: .izin, .skip, .ganti.`
+      },
+      normal: {
+        ask_count: `Mau berapa gambar ${data.query}? Ketik \`.1\` sampai \`.10\` ya.`,
+        ask_mode: `Mau safe, all, atau r18? Ketik \`.safe\` / \`.all\` / \`.r18\`.`,
+        loading: `Sip, tunggu bentar ya lagi dicari.`,
+        done: `Ini dia gambarnya.`,
+        error: `Gagal mengambil gambar atau tidak ditemukan.`,
+        timeout: `Sesi Pixiv kedaluwarsa karena tidak ada respons.`,
+        invalid: `Input tidak valid, tolong disesuaikan.`,
+        typo_fix: `Maksud kamu \`${data.corrected}\` ya. Lanjut proses.`,
+        r18_pending: `R18 butuh izin admin/owner. Aku kirimkan permintaannya dulu ya.`,
+        r18_granted: `Izin disetujui admin. Lanjut proses ya.`,
+        r18_denied: `Ditolak admin. Silakan coba safe atau all.`,
+        all_r18_choice: `Ada *${data.count} gambar r18* ketahan. Mau:\n\`.izin\` — minta izin admin\n\`.skip\` — skip aja\n\`.ganti\` — ganti yang safe`
+      },
+      happy: {
+        ask_count: `Oke, mau cari gambar ${data.query}? Mau berapa nih? Ketik \`.1\` sampai \`.10\` ya!`,
+        ask_mode: `Siap, ${data.count} gambar dicatat. Mau mode safe, all, atau r18? Ketik \`.safe\` / \`.all\` / \`.r18\` ya.`,
+        loading: `Oke, tunggu bentar ya, lagi proses pencarian dan download nih.`,
+        done: `Nah, udah selesai nih. Ini gambarnya!`,
+        error: `Waduh, gagal nih gambarnya nggak ketemu. Coba lagi ya.`,
+        timeout: `Wah kelamaan nih, sesinya hangus. Ulangi dari awal aja ya.`,
+        invalid: `Inputnya salah tuh. Tolong ketik yang bener ya.`,
+        typo_fix: `Oh, maksud kamu \`${data.corrected}\` kan? Sip, lanjut!`,
+        r18_pending: `Waduh mau r18 ya. Aku mintain izin ke admin/owner dulu ya, tunggu bentar.`,
+        r18_granted: `Kabar baik, admin udah ngasih izin nih. Langsung diproses ya!`,
+        r18_denied: `Ditolak nih sama admin. Mau coba yang safe atau all aja?`,
+        all_r18_choice: `Eh, ada *${data.count} gambar r18* ketahan nih. Mau gimana?\n\`.izin\` — tanya admin\n\`.skip\` — lewati aja\n\`.ganti\` — ganti sama gambar safe`
+      }
+    },
+    serius: {
+      cold: {
+        ask_count: `Berapa gambar. Ketik .1 hingga .10.`,
+        ask_mode: `Pilih mode: .safe / .all / .r18.`,
+        loading: `Sedang diproses.`,
+        done: `Selesai.`,
+        error: `Gagal.`,
+        timeout: `Sesi berakhir.`,
+        invalid: `Input salah.`,
+        typo_fix: `Koreksi ke \`${data.corrected}\`.`,
+        r18_pending: `Menunggu izin R18.`,
+        r18_granted: `Izin diberikan. Proses.`,
+        r18_denied: `Ditolak.`,
+        all_r18_choice: `Ada *${data.count} R18*. Pilihan:\n.izin\n.skip\n.ganti`
+      },
+      normal: {
+        ask_count: `Silakan pilih jumlah gambar ${data.query} yang diinginkan dengan mengetik \`.1\` hingga \`.10\`.`,
+        ask_mode: `Silakan pilih mode konten yang diinginkan: \`.safe\`, \`.all\`, atau \`.r18\`.`,
+        loading: `Pencarian sedang diproses. Mohon tunggu sebentar.`,
+        done: `Proses pengiriman gambar telah selesai.`,
+        error: `Gagal melakukan pencarian atau berkas tidak ditemukan.`,
+        timeout: `Sesi Pixiv kedaluwarsa karena tidak ada respons.`,
+        invalid: `Input tidak valid. Harap masukkan format yang sesuai.`,
+        typo_fix: `Maksud Anda adalah \`${data.corrected}\`. Melanjutkan ke langkah berikutnya.`,
+        r18_pending: `Konten R18 memerlukan izin admin. Permintaan sedang diajukan.`,
+        r18_granted: `Izin R18 disetujui. Memulai proses.`,
+        r18_denied: `Permintaan ditolak. Silakan gunakan opsi safe atau all.`,
+        all_r18_choice: `Terdapat *${data.count} gambar R18* yang tertahan. Silakan tentukan pilihan Anda:\n\`.izin\` untuk meminta izin,\n\`.skip\` untuk melewati,\n\`.ganti\` untuk menukar dengan konten safe.`
+      },
+      happy: {
+        ask_count: `Saya akan mencarikan gambar ${data.query}. Silakan tentukan jumlahnya dengan mengetik antara \`.1\` hingga \`.10\`.`,
+        ask_mode: `Permintaan ${data.count} gambar diterima. Silakan pilih kategori konten: \`.safe\` (aman), \`.all\` (semua), atau \`.r18\` (dewasa).`,
+        loading: `Pencarian sedang diproses. Mohon tunggu beberapa saat selagi sistem mengunduh berkas.`,
+        done: `Proses selesai. Berikut adalah gambar yang berhasil ditemukan.`,
+        error: `Terjadi kesalahan atau gambar tidak ditemukan. Silakan periksa kembali kata kunci pencarian Anda.`,
+        timeout: `Sesi pencarian telah berakhir karena tidak ada respons dalam waktu yang ditentukan. Silakan ulangi perintah.`,
+        invalid: `Input yang Anda masukkan tidak valid. Harap ikuti format yang telah ditentukan.`,
+        typo_fix: `Saya berasumsi maksud Anda adalah \`${data.corrected}\`. Melanjutkan proses.`,
+        r18_pending: `Konten R18 memerlukan verifikasi admin. Pengajuan izin sedang dikirimkan kepada admin/owner.`,
+        r18_granted: `Izin akses R18 telah disetujui oleh administrator. Memulai pengunduhan gambar.`,
+        r18_denied: `Permintaan akses R18 ditolak oleh administrator. Silakan pilih kategori safe atau all.`,
+        all_r18_choice: `Ditemukan *${data.count} gambar berkategori R18* yang tertahan. Silakan pilih tindakan:\n\`.izin\` — ajukan izin ke admin\n\`.skip\` — abaikan gambar R18\n\`.ganti\` — ganti dengan gambar kategori safe`
+      }
+    }
+  };
+
+  const personaSet = responses[persona] || responses.ceria;
+  const moodSet = personaSet[mood] || personaSet.normal;
+  const text = moodSet[type] || responses.ceria.normal[type] || 'Sedang memproses...';
+  return text;
+}
+
+// Check if group admin
+async function checkIsAdmin(ctx) {
+  if (ctx.isOwner) return true;
+  if (!ctx.group) return false;
+  try {
+    const meta = await ctx.sock.groupMetadata(ctx.jid);
+    const admins = meta.participants.filter(p => p.admin).map(p => p.id);
+    return admins.includes(ctx.sender);
+  } catch {
+    return false;
+  }
+}
+
+// Forward request R18 to admin/owner
+async function forwardR18Request(ctx, query, count) {
+  const senderJid = ctx.sender;
+  const cleanNum = senderJid.split('@')[0];
+  const formattedNum = `+${cleanNum}`;
+  const pushName = ctx.msg.pushName || cleanNum;
+  const waktuStr = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jakarta' }) + ' WIB';
+
+  const text = `🔞 *Request Akses R18*
+
+Nomor: ${formattedNum}
+Nama: ${pushName}
+Keyword: ${query}
+Jumlah: ${count} gambar
+Waktu: ${waktuStr}
+
+Ketik *.allow ${cleanNum}* untuk izinkan
+Ketik *.deny ${cleanNum}* untuk tolak
+
+_Request expired dalam 10 menit_`;
+
+  const targets = new Set();
+  
+  for (const o of config.owners) {
+    if (o) {
+      const jid = o.includes('@') ? o : `${o.replace(/\D/g, '')}@s.whatsapp.net`;
+      targets.add(jid);
+    }
+  }
+  if (config.owner) {
+    const jid = config.owner.includes('@') ? config.owner : `${config.owner.replace(/\D/g, '')}@s.whatsapp.net`;
+    targets.add(jid);
+  }
+
+  if (ctx.group) {
+    try {
+      const meta = await ctx.sock.groupMetadata(ctx.jid);
+      const admins = meta.participants.filter(p => p.admin).map(p => p.id);
+      for (const a of admins) {
+        targets.add(a);
+      }
+    } catch (err) {
+      log.error(`Gagal ambil admin grup saat forward: ${err.message}`);
+    }
+  }
+
+  targets.delete(senderJid);
+
+  for (const t of targets) {
+    try {
+      await ctx.sock.sendMessage(t, { text });
+      await delay(500);
+    } catch (err) {
+      log.error(`Gagal forward ke ${t}: ${err.message}`);
+    }
+  }
+}
+
+// Process download and send images
+async function processAndSendImages(ctx, query, count, mode, profile, savedR18Images = null) {
+  const replyLoad = getPixivReply(profile, 'loading');
+  const suggestion = getLoadingSuggestion(profile);
+  await ctx.reply({ text: `${replyLoad}\n\n💡 _${suggestion}_` });
+
+  let files = [];
+  try {
+    if (savedR18Images) {
+      files = savedR18Images;
+    } else {
+      const results = await searchPixiv(query, mode);
+      if (results.length === 0) {
+        await ctx.reply({ text: getPixivReply(profile, 'error') });
+        return;
+      }
+
+      // Pick unique random items up to count
+      const shuffled = [...results].sort(() => 0.5 - Math.random());
+      const picked = shuffled.slice(0, count);
+
+      const downloadedFiles = [];
+      for (const item of picked) {
+        try {
+          const detail = await getArtworkDetail(item.id);
+          const pageUrl = detail.pages[0]; // first page
+          if (pageUrl) {
+            const filePath = await downloadPixivImage(pageUrl, detail.Id, 1);
+            downloadedFiles.push({
+              File: filePath,
+              meta: detail
+            });
+            await delay(DOWNLOAD_DELAY_MS);
+          }
+        } catch (e) {
+          log.error(`Gagal unduh detail/gambar untuk id ${item.id}: ${e.message}`);
+        }
+      }
+
+      if (downloadedFiles.length === 0) {
+        await ctx.reply({ text: getPixivReply(profile, 'error') });
+        return;
+      }
+
+      const isAdminUser = ctx.isOwner || await checkIsAdmin(ctx);
+
+      if (mode === 'all' && !isAdminUser) {
+        const safeImages = downloadedFiles.filter(f => !isR18(f.meta));
+        const r18Images = downloadedFiles.filter(f => isR18(f.meta));
+
+        // Kirim yang safe langsung
+        if (safeImages.length > 0) {
+          for (let i = 0; i < safeImages.length; i++) {
+            const caption = buildCaption(safeImages[i].meta, 1);
+            await ctx.sock.sendMessage(ctx.jid, {
+              image: { url: safeImages[i].File },
+              caption
+            }, { quoted: ctx.msg });
+            try {
+              if (fs.existsSync(safeImages[i].File)) fs.unlinkSync(safeImages[i].File);
+            } catch {}
+            await delay(500);
+          }
+        }
+
+        // Kalau ada r18, tahan dan tanya
+        if (r18Images.length > 0) {
+          pixivStates.set(ctx.sender, {
+            step: 'all_r18_choice',
+            query,
+            count,
+            mode,
+            expiry: Date.now() + 3 * 60 * 1000,
+            safeImages: safeImages.map(f => f.meta.Id),
+            r18Images, // Simpan paths + meta
+            waitingR18: false
+          });
+
+          await ctx.reply({ text: getPixivReply(profile, 'all_r18_choice', { count: r18Images.length }) });
+          return;
+        } else {
+          await ctx.reply({ text: getPixivReply(profile, 'done') });
+          return;
+        }
+      }
+
+      files = downloadedFiles;
+    }
+
+    // Normal send for all downloaded files
+    for (let i = 0; i < files.length; i++) {
+      const caption = buildCaption(files[i].meta, 1);
+      await ctx.sock.sendMessage(ctx.jid, {
+        image: { url: files[i].File },
+        caption
+      }, { quoted: ctx.msg });
+      try {
+        if (fs.existsSync(files[i].File)) fs.unlinkSync(files[i].File);
+      } catch {}
+      await delay(500);
+    }
+
+    await ctx.reply({ text: getPixivReply(profile, 'done') });
+
+  } catch (err) {
+    log.error(`Error in processAndSendImages: ${err.message}`);
+    if (err.message === 'Cloudflare Challenge') {
+      await ctx.reply({ text: 'Pixiv lagi diblokir sementara (Cloudflare Challenge) 🥀' });
+    } else {
+      await ctx.reply({ text: getPixivReply(profile, 'error') });
+    }
+    // Cleanup files if error
+    for (const f of files) {
+      try {
+        if (fs.existsSync(f.File)) fs.unlinkSync(f.File);
+      } catch {}
+    }
+  }
+}
+
+// MAIN EXPORTS
+export default {
+  name: 'pixiv',
+  aliases: [],
+  description: 'Cari dan kirim artwork dari Pixiv',
+  cooldown: 10,
+  xp: 5,
+  ownerOnly: false,
+  groupOnly: false,
+  privateOnly: false,
+
+  run: async (ctx, args) => {
+    cleanExpiredStates();
+    const sender = ctx.sender;
+    const profile = await getUserProfile(sender);
+    
+    // Check if query is empty
+    const query = args.join(' ').trim();
+    if (!query) {
+      await ctx.reply({ text: 'Mau cari apa? Masukkan keyword pencarian Pixiv setelah command!' });
+      return;
+    }
+
+    // Initialize state
+    pixivStates.set(sender, {
+      step: 1,
+      query,
+      count: 0,
+      mode: '',
+      expiry: Date.now() + 3 * 60 * 1000,
+      waitingR18: false
+    });
+
+    const replyText = getPixivReply(profile, 'ask_count', { query });
+    await ctx.reply({ text: replyText });
+  }
+};
+
+// Plugin for steps 2 & 3 & all_r18_choice
+export const pixivSessionPlugin = {
+  name: 'pixiv-session',
+  priority: 1,
+  publicOnly: false,
+  disabled: false,
+
+  run: async (ctx) => {
+    cleanExpiredStates();
+    const sender = ctx.sender;
+    if (!pixivStates.has(sender)) return false;
+
+    const state = pixivStates.get(sender);
+    const profile = await getUserProfile(sender);
+    const text = ctx.text.trim();
+
+    // If waiting for R18 permission, ignore commands except maybe status checks
+    if (state.waitingR18) {
+      return false; // let the command run or do nothing
+    }
+
+    // Step 2: Input count
+    if (state.step === 1) {
+      // Typo correction for count
+      // Clean letters resembling numbers: 'l' -> '1', 'O' -> '0'
+      let cleaned = text.replace(/l/g, '1').replace(/O/g, '0');
+      // Extract all digits
+      const digitsMatch = cleaned.match(/\d+/g);
+      let countVal = 0;
+      if (digitsMatch) {
+        // Take first digit sequence and parse
+        countVal = parseInt(digitsMatch.join(''), 10);
+      }
+
+      if (countVal < 1 || countVal > 10) {
+        await ctx.reply({ text: getPixivReply(profile, 'invalid') + '\n\nKetik `.1` sampai `.10` ya.' });
+        return true;
+      }
+
+      // Check if typo corrected
+      const expectedText = `.${countVal}`;
+      if (text !== expectedText && text !== String(countVal)) {
+        // notify user of correction
+        const replyTypo = getPixivReply(profile, 'typo_fix', { original: text, corrected: expectedText });
+        await ctx.reply({ text: replyTypo });
+      }
+
+      state.count = countVal;
+      state.step = 2;
+      state.expiry = Date.now() + 3 * 60 * 1000;
+      pixivStates.set(sender, state);
+
+      await ctx.reply({ text: getPixivReply(profile, 'ask_mode', { count: countVal }) });
+      return true;
+    }
+
+    // Step 3: Input mode
+    if (state.step === 2) {
+      // Fuzzy correction for mode
+      const cleanInput = text.toLowerCase().replace(/[^a-z0-9]/g, '');
+      let correctedMode = '';
+
+      if (cleanInput.includes('saf') || cleanInput.includes('sfe') || cleanInput.includes('save')) {
+        correctedMode = 'safe';
+      } else if (cleanInput.includes('all') || cleanInput.includes('aal') || cleanInput === 'al') {
+        correctedMode = 'all';
+      } else if (cleanInput.includes('r18') || cleanInput.includes('18') || cleanInput.includes('r1')) {
+        correctedMode = 'r18';
+      }
+
+      if (!correctedMode) {
+        await ctx.reply({ text: getPixivReply(profile, 'invalid') + '\n\nKetik `.safe` / \`.all\` / \`.r18\` ya.' });
+        return true;
+      }
+
+      // Typo notify
+      const expectedText = `.${correctedMode}`;
+      if (text.toLowerCase() !== expectedText && text.toLowerCase() !== correctedMode) {
+        const replyTypo = getPixivReply(profile, 'typo_fix', { original: text, corrected: expectedText });
+        await ctx.reply({ text: replyTypo });
+      }
+
+      state.mode = correctedMode;
+
+      // Access permission logic for R18
+      const isAdminUser = ctx.isOwner || await checkIsAdmin(ctx);
+
+      if (correctedMode === 'r18') {
+        if (isAdminUser) {
+          // Admin/Owner directly approved
+          pixivStates.delete(sender);
+          await processAndSendImages(ctx, state.query, state.count, 'r18', profile);
+        } else {
+          // Check if there is an active one-time grant
+          const grant = r18GrantMap.get(sender);
+          if (grant && !grant.used && Date.now() < grant.grantedAt + 10 * 60 * 1000) {
+            // Use the grant
+            r18GrantMap.delete(sender);
+            pixivStates.delete(sender);
+            await processAndSendImages(ctx, state.query, state.count, 'r18', profile);
+          } else {
+            // Trigger R18 Permission Flow
+            state.waitingR18 = true;
+            state.expiry = Date.now() + 10 * 60 * 1000; // extended to 10 min
+            pixivStates.set(sender, state);
+
+            r18PendingMap.set(sender, {
+              query: state.query,
+              count: state.count,
+              requestedAt: Date.now(),
+              expiry: Date.now() + 10 * 60 * 1000,
+              grantedBy: null,
+              groupId: ctx.group ? ctx.jid : null
+            });
+
+            await ctx.reply({ text: getPixivReply(profile, 'r18_pending') });
+            const suggestion = getLoadingSuggestion(profile);
+            await ctx.reply({ text: `💡 _${suggestion}_` });
+
+            await forwardR18Request(ctx, state.query, state.count);
+          }
+        }
+      } else {
+        // Safe or All mode
+        pixivStates.delete(sender);
+        await processAndSendImages(ctx, state.query, state.count, correctedMode, profile);
+      }
+
+      return true;
+    }
+
+    // Step Choice: all_r18_choice
+    if (state.step === 'all_r18_choice') {
+      const cleanInput = text.toLowerCase().replace(/[^a-z0-9]/g, '');
+      let correctedChoice = '';
+
+      // Fuzzy matching options
+      // .izin: izinn / izin. / minta izin / admin
+      if (cleanInput.includes('izin') || cleanInput.includes('admi')) {
+        correctedChoice = 'izin';
+      }
+      // .skip: skip / skipp / lewati / gapapa / ga usah / gausah
+      else if (cleanInput.includes('skip') || cleanInput.includes('lewat') || cleanInput.includes('gapapa') || cleanInput.includes('usah')) {
+        correctedChoice = 'skip';
+      }
+      // .ganti: ganti / tukar / replace / gantin
+      else if (cleanInput.includes('gant') || cleanInput.includes('tukar') || cleanInput.includes('repl')) {
+        correctedChoice = 'ganti';
+      }
+
+      if (!correctedChoice) {
+        await ctx.reply({ text: getPixivReply(profile, 'invalid') + '\n\nKetik `.izin` / \`.skip\` / \`.ganti\`' });
+        return true;
+      }
+
+      const expectedText = `.${correctedChoice}`;
+      if (text.toLowerCase() !== expectedText && text.toLowerCase() !== correctedChoice) {
+        const replyTypo = getPixivReply(profile, 'typo_fix', { original: text, corrected: expectedText });
+        await ctx.reply({ text: replyTypo });
+      }
+
+      if (correctedChoice === 'skip') {
+        // Delete the held r18 images from temp
+        if (state.r18Images) {
+          for (const img of state.r18Images) {
+            try {
+              if (fs.existsSync(img.File)) fs.unlinkSync(img.File);
+            } catch {}
+          }
+        }
+        pixivStates.delete(sender);
+        await ctx.reply({ text: getPixivReply(profile, 'done') });
+      } 
+      else if (correctedChoice === 'ganti') {
+        // Replace: search Pixiv again with mode: 'safe', count = state.r18Images.length
+        const replaceCount = state.r18Images ? state.r18Images.length : 1;
+        // Clean old r18 files
+        if (state.r18Images) {
+          for (const img of state.r18Images) {
+            try {
+              if (fs.existsSync(img.File)) fs.unlinkSync(img.File);
+            } catch {}
+          }
+        }
+        pixivStates.delete(sender);
+        // Process new download
+        await processAndSendImages(ctx, state.query, replaceCount, 'safe', profile);
+      } 
+      else if (correctedChoice === 'izin') {
+        // Trigger R18 Permission Flow with held r18Images
+        state.waitingR18 = true;
+        state.expiry = Date.now() + 10 * 60 * 1000;
+        pixivStates.set(sender, state);
+
+        r18PendingMap.set(sender, {
+          query: state.query,
+          count: state.r18Images ? state.r18Images.length : 1,
+          requestedAt: Date.now(),
+          expiry: Date.now() + 10 * 60 * 1000,
+          grantedBy: null,
+          groupId: ctx.group ? ctx.jid : null,
+          isAllModeResume: true // flag that this is resuming from all_r18_choice
+        });
+
+        await ctx.reply({ text: getPixivReply(profile, 'r18_pending') });
+        const suggestion = getLoadingSuggestion(profile);
+        await ctx.reply({ text: `💡 _${suggestion}_` });
+
+        await forwardR18Request(ctx, state.query, state.r18Images ? state.r18Images.length : 1);
+      }
+
+      return true;
+    }
+
+    return false;
+  }
+};
+
+// Admin Commands
+export const allowR18Command = {
+  name: 'allow',
+  ownerOnly: false,
+  run: async (ctx, args) => {
+    cleanExpiredStates();
+    const targetNum = args[0]?.replace(/\D/g, '');
+    if (!targetNum) {
+      await ctx.reply({ text: 'Format salah. Contoh: `.allow 628xxxxxxxx`' });
+      return;
+    }
+
+    // Find the pending request
+    let requesterJid = null;
+    let pendingReq = null;
+    for (const [sender, req] of r18PendingMap.entries()) {
+      if (sender.split('@')[0].replace(/\D/g, '') === targetNum) {
+        requesterJid = sender;
+        pendingReq = req;
+        break;
+      }
+    }
+
+    if (!pendingReq || Date.now() > pendingReq.expiry) {
+      await ctx.reply({ text: 'Request tidak ditemukan atau sudah expired.' });
+      return;
+    }
+
+    // Verify if sender has permission to approve
+    let isAllowed = ctx.isOwner;
+    if (!isAllowed && pendingReq.groupId) {
+      try {
+        const meta = await ctx.sock.groupMetadata(pendingReq.groupId);
+        const admins = meta.participants.filter(p => p.admin).map(p => p.id);
+        isAllowed = admins.includes(ctx.sender);
+      } catch {}
+    }
+
+    if (!isAllowed) {
+      await ctx.reply({ text: 'Kamu bukan admin/owner.' });
+      return;
+    }
+
+    // Approve
+    r18GrantMap.set(requesterJid, { grantedAt: Date.now(), used: false });
+    r18PendingMap.delete(requesterJid);
+
+    await ctx.reply({ text: `✅ Akses r18 diberikan ke ${targetNum} (1x pakai)` });
+
+    // Notify requester and proceed
+    const state = pixivStates.get(requesterJid);
+    const requesterProfile = await getUserProfile(requesterJid);
+    const isAllModeResume = pendingReq.isAllModeResume;
+
+    const notifyText = getPixivReply(requesterProfile, 'r18_granted');
+    await ctx.sock.sendMessage(requesterJid, { text: notifyText });
+
+    if (state) {
+      r18GrantMap.delete(requesterJid); // mark used
+      pixivStates.delete(requesterJid);
+      
+      const newCtx = {
+        ...ctx,
+        jid: requesterJid,
+        sender: requesterJid,
+        msg: state.msg || ctx.msg, // fallback to avoid errors
+        reply: async (content, options = {}) => {
+          return ctx.sock.sendMessage(requesterJid, content, { ...options });
+        }
+      };
+
+      if (isAllModeResume && state.r18Images) {
+        // Send the pre-downloaded held images
+        await processAndSendImages(newCtx, state.query, state.r18Images.length, 'r18', requesterProfile, state.r18Images);
+      } else {
+        await processAndSendImages(newCtx, state.query, state.count, 'r18', requesterProfile);
+      }
+    }
+  }
+};
+
+export const denyR18Command = {
+  name: 'deny',
+  ownerOnly: false,
+  run: async (ctx, args) => {
+    cleanExpiredStates();
+    const targetNum = args[0]?.replace(/\D/g, '');
+    if (!targetNum) {
+      await ctx.reply({ text: 'Format salah. Contoh: `.deny 628xxxxxxxx`' });
+      return;
+    }
+
+    let requesterJid = null;
+    let pendingReq = null;
+    for (const [sender, req] of r18PendingMap.entries()) {
+      if (sender.split('@')[0].replace(/\D/g, '') === targetNum) {
+        requesterJid = sender;
+        pendingReq = req;
+        break;
+      }
+    }
+
+    if (!pendingReq || Date.now() > pendingReq.expiry) {
+      await ctx.reply({ text: 'Request tidak ditemukan atau sudah expired.' });
+      return;
+    }
+
+    let isAllowed = ctx.isOwner;
+    if (!isAllowed && pendingReq.groupId) {
+      try {
+        const meta = await ctx.sock.groupMetadata(pendingReq.groupId);
+        const admins = meta.participants.filter(p => p.admin).map(p => p.id);
+        isAllowed = admins.includes(ctx.sender);
+      } catch {}
+    }
+
+    if (!isAllowed) {
+      await ctx.reply({ text: 'Kamu bukan admin/owner.' });
+      return;
+    }
+
+    // Deny
+    r18PendingMap.delete(requesterJid);
+    const state = pixivStates.get(requesterJid);
+    
+    // Clean up temp files if all_r18_choice is denied
+    if (state && state.r18Images) {
+      for (const img of state.r18Images) {
+        try {
+          if (fs.existsSync(img.File)) fs.unlinkSync(img.File);
+        } catch {}
+      }
+    }
+    
+    pixivStates.delete(requesterJid);
+
+    await ctx.reply({ text: `❌ Request r18 dari ${targetNum} ditolak` });
+
+    const requesterProfile = await getUserProfile(requesterJid);
+    const notifyText = getPixivReply(requesterProfile, 'r18_denied');
+    await ctx.sock.sendMessage(requesterJid, { text: notifyText });
+  }
+};

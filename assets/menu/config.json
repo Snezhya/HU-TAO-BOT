@@ -1,0 +1,9 @@
+{
+  "footer": "Hu Tao AI • Yandere Mode",
+  "sourceUrl": "https://github.com",
+  "bannerImage": "banner.jpg",
+  "bannerGif": "banner.gif",
+  "thumbnail": "thumb.jpg",
+  "style": "auto",
+  "notes": "Letakkan file gambar/GIF di folder ini. Nama file bisa diubah di config ini atau lewat .env MENU_*"
+}

@@ -1,0 +1,46 @@
+{
+  "name": "hu-tao-ai-bot",
+  "version": "2.0.0",
+  "description": "WhatsApp AI bot Hu Tao — Baileys, Gemini/Groq, MongoDB, Railway-ready",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "test": "node test/smoke.js",
+    "test:ai": "node test/smoke.js --ai",
+    "menu:init": "node -e \"import('./lib/menu-media.js').then(m=>m.ensureMenuMedia())\""
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "hu-tao",
+    "ai-bot",
+    "railway",
+    "mongodb"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@google/generative-ai": "^0.21.0",
+    "@huggingface/inference": "^4.13.18",
+    "@whiskeysockets/baileys": "^6.7.18",
+    "axios": "^1.7.9",
+    "brat-canvas": "^1.0.30",
+    "chalk": "^5.4.1",
+    "cheerio": "^1.2.0",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "fluent-ffmpeg": "^2.1.3",
+    "mongoose": "^8.9.3",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "sharp": "^0.33.5",
+    "tesseract.js": "^5.1.1"
+  }
+}
